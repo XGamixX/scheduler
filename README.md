@@ -24,8 +24,9 @@ scheduler.py               Core library: NTP queries, calibration, clock model,
 keystroke.py               CLI entry point and one-shot keystroke injection.
 test_listener.py            System-clock-only global key listener for sanity checks.
 test_directional_math.py    Synthetic tests for the directional-delay equations.
-test_cli_imports.py         Regression test for CLI configuration imports.
+test_startup_keyboard_check.py  Tests for the Enter-based startup keyboard check.
 requirements.txt            Dependencies for the command-line and test tools.
+README.md                   Documentation.
 
 Install
 -------
@@ -34,6 +35,21 @@ python -m pip install -r requirements.txt
 Run the listener first
 ----------------------
 python test_listener.py --time 14:30:00 --key enter
+
+Startup keyboard preflight
+--------------------------
+The preflight is enabled by default. First, focus the terminal and press Enter
+when prompted. The program then starts a global keyboard listener and sends an
+Enter keypress. It allows up to 10 seconds for capture so you can approve an
+OS permission prompt if necessary. It then sends a second Enter and allows up
+to 1 second for immediate capture. A failure produces a prominent warning but
+does not stop scheduling. The injected Enter keypresses go to the focused
+application; keep the terminal focused during this check.
+
+Disable the preflight (including the terminal-focus prompt) with:
+    python keystroke.py --no-startup-key-test
+
+The equivalent alias is --skip-startup-key-test.
 
 Run the keystroke entry point with multi-server calibration
 -----------------------------------------------------------
@@ -49,9 +65,9 @@ Adjust calibration samples (default 12 per server):
 Disable the JSON calibration report:
     python keystroke.py --time 14:30:00 --key enter --calibrate --calibration-report ""
 
-Run synthetic equation test
+Run synthetic equation tests
 ----------------------------
-python -m unittest -v test_directional_math.py
+python -m unittest -v test_directional_math.py test_startup_keyboard_check.py
 
 Using scheduler.py as a library
 -------------------------------
