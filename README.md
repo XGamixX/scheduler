@@ -23,8 +23,8 @@ scheduler.py               Core library: NTP queries, calibration, clock model,
                            and waiting. No CLI and no keyboard injection.
 keystroke.py               CLI entry point and one-shot keystroke injection.
 test_listener.py            System-clock-only global key listener for sanity checks.
-test_directional_math.py    Synthetic tests for the directional-delay equations.
-test_startup_keyboard_check.py  Tests for the Enter-based startup keyboard check.
+tests/test_directional_math.py      Synthetic tests for directional-delay equations.
+tests/test_startup_keyboard_check.py  Tests for the Enter-based startup keyboard check.
 requirements.txt            Dependencies for the command-line and test tools.
 README.md                   Documentation.
 
@@ -65,9 +65,9 @@ Adjust calibration samples (default 12 per server):
 Disable the JSON calibration report:
     python keystroke.py --time 14:30:00 --key enter --calibrate --calibration-report ""
 
-Run synthetic equation tests
+Run unit tests
 ----------------------------
-python -m unittest -v test_directional_math.py test_startup_keyboard_check.py
+python -m unittest discover -s tests -v
 
 Using scheduler.py as a library
 -------------------------------
@@ -130,14 +130,28 @@ Scheduling and limitations
 --------------------------
 - The target is the next local HH:MM:SS occurrence. If today's time has
   already passed when the entry point starts, it schedules tomorrow.
-- The target is selected before initial calibration so calibration duration
-  does not accidentally move today's requested occurrence to tomorrow.
+- The local system clock is installed as the first time source, so a usable
+  schedule exists even when NTP is unavailable.
+- Full multi-server calibration runs only when more than 60 seconds remain.
+  Its measurements stop at the T-60 s boundary. If full calibration is not
+  eligible (or fails), the program uses one NTP server instead.
+- No initial NTP request or later single-server refresh is started with 10
+  seconds or less remaining. Individual UDP timeouts are shortened to fit
+  before the T-10 s boundary. DNS resolution is also bounded by a daemon
+  resolver thread, so a slow system resolver cannot hold up the keypress. If
+  no first NTP sync can be completed, the scheduler stays on system time
+  rather than delaying or exiting.
+- After every successful NTP model installation (full calibration or
+  single-server refresh), the program prints the NTP/model offset relative to
+  the system clock. An absolute difference of 1 second or more produces a
+  warning, but does not stop execution.
 - The scheduler uses time.monotonic_ns() for countdowns and busy-polls during
   the final 100 ms. System wall-clock steps do not directly jump the countdown.
 - Failed refreshes retain the last successful clock model and increase the
   displayed uncertainty proxy with the configured oscillator-drift allowance.
-- If initial synchronization fails, the entry point retries because there is
-  no previous successful model to fall back to.
+- If initial synchronization fails, the scheduler continues with system time
+  and retries at the configured retry interval, provided more than 10 seconds
+  remain.
 - The 10 ms target is not guaranteed. NTP path asymmetry, server clock errors,
   timestamping, OS scheduling and input-injection latency remain.
 - test_listener.py intentionally uses only the system wall clock for its

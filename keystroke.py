@@ -28,18 +28,19 @@ from scheduler import (
     DEFAULT_CALIBRATION_SAMPLES,
     DEFAULT_SERVER,
     Endpoint,
+    FULL_CALIBRATION_MIN_REMAINING_SECONDS,
     MAX_DRIFT_PPM,
+    MIN_NTP_SYNC_REMAINING_SECONDS,
     NTP_TIMEOUT_SECONDS,
     RETRY_INTERVAL_SECONDS,
     SYNC_INTERVAL_SECONDS,
     SYNC_SAMPLES,
     SYNC_SPACING_SECONDS,
-    Sample,
     SyncedClock,
     calibrate,
+    collect_single_server_samples,
     next_local_target_utc_ns,
-    query_ntp,
-    resolve_endpoint,
+    resolve_endpoint_before,
     wait_until,
 )
 
@@ -98,12 +99,50 @@ def _big_keyboard_warning(message: str) -> None:
     print(border + "\n", flush=True)
 
 
+def _wait_for_probe_key(
+    event_queue: queue.Queue[tuple[str, int]],
+    expected: str,
+    timeout_seconds: float,
+    listener_available: bool,
+    not_before_ns: Optional[int] = None,
+) -> bool:
+    """Wait until an absolute monotonic deadline; always time out conclusively."""
+    deadline_ns = time.monotonic_ns() + int(timeout_seconds * 1_000_000_000)
+
+    if not listener_available:
+        # Preserve the full grace period even when the listener could not start,
+        # then allow the caller to proceed to the second (short) probe.
+        while True:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                return False
+            time.sleep(remaining_ns / 1e9)
+
+    while True:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return False
+        try:
+            observed, observed_ns = event_queue.get(timeout=remaining_ns / 1e9)
+        except queue.Empty:
+            # Recheck the monotonic deadline rather than assuming a queue
+            # timeout or OS wake-up happened at precisely the requested time.
+            continue
+        if (
+            observed == expected
+            and observed_ns <= deadline_ns
+            and (not_before_ns is None or observed_ns >= not_before_ns)
+        ):
+            return True
+
+
 def _startup_keyboard_check() -> bool:
     """Confirm terminal focus, then verify global capture of two harmless keys.
 
-    The first synthetic key gets a 10-second grace period so the user can
-    approve an OS permission prompt. A second, different key is then sent and
-    must be observed promptly. Failure is non-fatal to the scheduler.
+    The first synthetic Enter gets a 10-second grace period so the user can
+    approve an OS permission prompt. A second Enter is then sent and must be
+    observed within one second. Both waits use absolute monotonic deadlines;
+    failure is non-fatal to the scheduler.
     """
     print("[Startup] Keyboard preflight is enabled.")
     if sys.stdin.isatty():
@@ -146,56 +185,59 @@ def _startup_keyboard_check() -> bool:
         except Exception as exc:
             return f"Could not inject {key_name.upper()}: {exc}"
 
-    def wait_for_key(expected: str, timeout: float) -> bool:
-        if listener is None:
-            time.sleep(timeout)
-            return False
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            try:
-                observed, _timestamp = event_queue.get(timeout=remaining)
-            except queue.Empty:
-                return False
-            if observed == expected:
-                return True
-
     print(
         f"[Startup] Sending first Enter probe (up to "
-        f"{STARTUP_FIRST_GRACE_SECONDS:.0f} seconds for capture).",
+        f"{STARTUP_FIRST_GRACE_SECONDS:g} seconds for capture).",
         flush=True,
     )
+    first_started_ns = time.monotonic_ns()
     first_injection_error = send_probe(STARTUP_FIRST_KEY)
-    first_caught = wait_for_key(STARTUP_FIRST_KEY, STARTUP_FIRST_GRACE_SECONDS)
+    first_caught = _wait_for_probe_key(
+        event_queue,
+        STARTUP_FIRST_KEY,
+        STARTUP_FIRST_GRACE_SECONDS,
+        listener is not None,
+        not_before_ns=first_started_ns,
+    )
 
     if first_caught:
         print(f"[Startup] First probe ({STARTUP_FIRST_KEY.upper()}) captured.")
     else:
         print(
             f"[Startup] First probe was not observed within "
-            f"{STARTUP_FIRST_GRACE_SECONDS:.0f} seconds; trying a second probe."
+            f"{STARTUP_FIRST_GRACE_SECONDS:g} seconds; trying a second probe."
         )
 
     # This is intentionally sent immediately after the first probe's grace
     # period (or immediately after a successful first capture).
     print(
         f"[Startup] Sending second Enter probe (up to "
-        f"{STARTUP_SECOND_GRACE_SECONDS:.1f} seconds for capture).",
+        f"{STARTUP_SECOND_GRACE_SECONDS:g} seconds for capture).",
         flush=True,
     )
+    second_started_ns = time.monotonic_ns()
     second_injection_error = send_probe(STARTUP_SECOND_KEY)
-    second_caught = wait_for_key(STARTUP_SECOND_KEY, STARTUP_SECOND_GRACE_SECONDS)
+    second_caught = _wait_for_probe_key(
+        event_queue,
+        STARTUP_SECOND_KEY,
+        STARTUP_SECOND_GRACE_SECONDS,
+        listener is not None,
+        not_before_ns=second_started_ns,
+    )
 
+    listener_shutdown_error: Optional[str] = None
     if listener is not None:
         try:
             listener.stop()
-            listener.join(timeout=1.0)
+            listener.join(timeout=0.10)
+            if listener.is_alive():
+                listener_shutdown_error = (
+                    "The global keyboard listener did not stop within 100 ms."
+                )
         except Exception:
-            pass
+            listener_shutdown_error = "Could not cleanly stop the global keyboard listener."
 
-    if second_caught:
+    if second_caught and listener_shutdown_error is None:
         if first_caught:
             print("[Startup] Keyboard injection and global capture verified.", flush=True)
         else:
@@ -213,10 +255,12 @@ def _startup_keyboard_check() -> bool:
         problems.append(first_injection_error)
     if second_injection_error:
         problems.append(second_injection_error)
+    if listener_shutdown_error:
+        problems.append(listener_shutdown_error)
     if not problems:
         problems.append(
             f"The listener did not observe the second Enter within "
-            f"{STARTUP_SECOND_GRACE_SECONDS:.1f} seconds."
+            f"{STARTUP_SECOND_GRACE_SECONDS:g} seconds."
         )
     _big_keyboard_warning("\n".join(problems))
     return False
@@ -237,87 +281,143 @@ def main() -> int:
     if args.sync_interval <= 0 or args.retry_interval <= 0 or args.timeout <= 0:
         parser.error("--sync-interval, --retry-interval and --timeout must be positive")
 
-    # Perform this before time calibration so permission prompts and the
-    # 10-second first-probe grace period do not consume the scheduled window.
+    # Complete any permissions/focus prompt before selecting today's target.
     if args.startup_key_test:
         _startup_keyboard_check()
 
-    # Choose the next local occurrence before calibration, so calibration time
-    # itself does not accidentally push today's requested occurrence to tomorrow.
+    # Select the requested local wall-clock occurrence, then immediately
+    # establish the system clock as the initial time source. NTP may replace
+    # this model, but the scheduler never starts without a usable clock.
     target_utc_ns = next_local_target_utc_ns(args.time)
-
     clock = SyncedClock(MAX_DRIFT_PPM)
+    clock.install_system_clock()
+
+    target_local = datetime.fromtimestamp(target_utc_ns / 1e9).astimezone()
+    target_utc = datetime.fromtimestamp(target_utc_ns / 1e9, tz=timezone.utc)
+    print(f"[Scheduler] Target local: {target_local.isoformat(timespec='seconds')}")
+    print(f"[Scheduler] Target UTC:   {target_utc.isoformat(timespec='seconds')}")
+    print(f"[Scheduler] Key: {args.key}")
+
     selected_endpoint: Optional[Endpoint] = None
     offset_correction_ns = 0
     correction_uncertainty_ns = 0
-    initial_samples: list[Sample] = []
+    full_calibration_completed = False
 
-    while clock.anchor_mono_ns is None:
+    remaining_seconds = (target_utc_ns - clock.now_utc_ns()) / 1e9
+    print(f"[Scheduler] Time remaining according to system clock: {remaining_seconds:.3f} s")
+
+    # Full multi-server calibration is deliberately restricted to runs that
+    # begin with more than one minute remaining. It also stops collecting at
+    # T-60 s; request timeouts are bounded by that same cutoff.
+    if args.calibrate and remaining_seconds > FULL_CALIBRATION_MIN_REMAINING_SECONDS:
+        print(
+            "[Calibration] More than 60 seconds remain; full multi-server "
+            "calibration is permitted."
+        )
+        stop_before_mono_ns = (
+            time.monotonic_ns()
+            + int((remaining_seconds - FULL_CALIBRATION_MIN_REMAINING_SECONDS) * 1e9)
+        )
+        report_path = Path(args.calibration_report) if args.calibration_report else None
         try:
-            if args.calibrate:
-                report_path = Path(args.calibration_report) if args.calibration_report else None
-                selected = calibrate(
-                    CALIBRATION_SERVERS,
-                    samples_per_server=args.samples,
-                    spacing=CALIBRATION_SPACING_SECONDS,
-                    timeout=args.timeout,
-                    report_path=report_path,
-                )
-                selected_endpoint = selected.endpoint
-                offset_correction_ns = selected.relative_bias_ns
-                correction_uncertainty_ns = selected.relative_bias_uncertainty_ns
-                initial_samples = selected.samples
-            else:
-                selected_endpoint = resolve_endpoint(args.server)
-                print(f"[NTP] Using {selected_endpoint.host}; multi-server calibration disabled.")
-                for index in range(SYNC_SAMPLES):
-                    try:
-                        initial_samples.append(query_ntp(selected_endpoint, args.timeout))
-                        sample = initial_samples[-1]
-                        print(
-                            f"  [NTP] initial {index + 1}/{SYNC_SAMPLES}: "
-                            f"offset={sample.offset_ns / 1e6:+.3f} ms, "
-                            f"RTT={sample.delay_ns / 1e6:.3f} ms"
-                        )
-                    except Exception as exc:
-                        print(f"  [NTP] initial {index + 1}/{SYNC_SAMPLES} failed: {exc}")
-                    if index + 1 < SYNC_SAMPLES:
-                        time.sleep(SYNC_SPACING_SECONDS)
-
-            if len(initial_samples) < 2:
-                raise RuntimeError("Fewer than two successful initial NTP samples")
-
+            selected = calibrate(
+                CALIBRATION_SERVERS,
+                samples_per_server=args.samples,
+                spacing=CALIBRATION_SPACING_SECONDS,
+                timeout=args.timeout,
+                report_path=report_path,
+                stop_before_mono_ns=stop_before_mono_ns,
+            )
+            selected_endpoint = selected.endpoint
+            offset_correction_ns = selected.relative_bias_ns
+            correction_uncertainty_ns = selected.relative_bias_uncertainty_ns
             clock.install_samples(
-                initial_samples,
+                selected.samples,
                 offset_correction_ns=offset_correction_ns,
                 correction_uncertainty_ns=correction_uncertainty_ns,
             )
+            full_calibration_completed = True
         except Exception as exc:
-            print(f"[NTP] Initial synchronization failed: {exc}")
-            print("[NTP] Retrying in 5 seconds; no successful time model exists yet.")
-            # Avoid repeatedly redoing a potentially expensive calibration after
-            # a partial initial failure; the next pass will recalibrate.
-            time.sleep(5)
-            initial_samples = []
-            selected_endpoint = None
+            print(f"[Calibration] Full calibration failed: {exc}")
+            print("[Clock] Retaining system time; a single-server sync may still be attempted.")
+    elif args.calibrate:
+        print(
+            "[Calibration] Full calibration skipped: it is only allowed when "
+            "more than 60 seconds remain."
+        )
 
-    assert selected_endpoint is not None
-    target_local = datetime.fromtimestamp(target_utc_ns / 1e9).astimezone()
-    target_utc = datetime.fromtimestamp(target_utc_ns / 1e9, tz=timezone.utc)
+    # Use one server if full calibration was not requested, was too late, or
+    # failed. This initial sync obeys the same T-10 s rule as every refresh.
+    if not full_calibration_completed:
+        remaining_seconds = (target_utc_ns - clock.now_utc_ns()) / 1e9
+        if remaining_seconds > MIN_NTP_SYNC_REMAINING_SECONDS:
+            print(
+                f"[NTP] Using one server ({args.server}); single-server sync is "
+                "permitted only while more than 10 seconds remain."
+            )
+            try:
+                resolution_deadline = (
+                    time.monotonic_ns()
+                    + int(
+                        (remaining_seconds - MIN_NTP_SYNC_REMAINING_SECONDS) * 1e9
+                    )
+                    - int(0.050 * 1e9)
+                )
+                selected_endpoint = resolve_endpoint_before(
+                    args.server, resolution_deadline
+                )
+                if selected_endpoint is None:
+                    print(
+                        "[NTP] DNS resolution did not finish before the "
+                        "10-second cutoff; retaining system time."
+                    )
+            except Exception as exc:
+                selected_endpoint = None
+                print(f"[NTP] Could not resolve {args.server}: {exc}")
 
-    print(f"[Scheduler] Target local: {target_local.isoformat(timespec='seconds')}")
-    print(f"[Scheduler] Target UTC:   {target_utc.isoformat(timespec='seconds')}")
-    print(f"[Scheduler] Selected NTP server: {selected_endpoint.host}")
-    print(f"[Scheduler] Key: {args.key}")
+            # DNS resolution can take time. Recheck the deadline before sending
+            # the first UDP request.
+            if selected_endpoint is not None:
+                samples = collect_single_server_samples(
+                    endpoint=selected_endpoint,
+                    clock=clock,
+                    target_utc_ns=target_utc_ns,
+                    count=SYNC_SAMPLES,
+                    spacing=SYNC_SPACING_SECONDS,
+                    timeout=args.timeout,
+                )
+                if samples:
+                    clock.install_samples(samples)
+                else:
+                    print("[NTP] No sample completed; retaining system time.")
+                    clock.mark_failed_attempt()
+            else:
+                clock.mark_failed_attempt()
+        else:
+            print(
+                "[NTP] Initial synchronization skipped: 10 seconds or less remain. "
+                "Staying on system time."
+            )
+
+    uncertainty_ns = clock.uncertainty_ns()
+    if uncertainty_ns is None:
+        print("[Scheduler] Time source: system clock; uncertainty is not independently known.")
+    else:
+        print(f"[Scheduler] Time source: {clock.source}")
+        print(
+            "[Scheduler] Current uncertainty proxy: "
+            f"{uncertainty_ns / 1e6:.3f} ms (not a certified bound)."
+        )
     print(
-        "[Scheduler] Current uncertainty proxy: "
-        f"{clock.uncertainty_ns() / 1e6:.3f} ms (not a certified bound)."
+        "[Scheduler] Selected NTP server: "
+        f"{selected_endpoint.host if selected_endpoint else args.server}"
     )
 
     wait_until(
         clock=clock,
         target_utc_ns=target_utc_ns,
         endpoint=selected_endpoint,
+        server_name=args.server,
         offset_correction_ns=offset_correction_ns,
         correction_uncertainty_ns=correction_uncertainty_ns,
         sync_interval=args.sync_interval,

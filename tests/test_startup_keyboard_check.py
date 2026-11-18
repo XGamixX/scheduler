@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import sys
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -72,8 +73,8 @@ class StartupKeyboardCheckTests(unittest.TestCase):
         self.isatty_patch.start()
         self.addCleanup(self.isatty_patch.stop)
 
-        self.first_grace_patch = patch.object(keystroke, "STARTUP_FIRST_GRACE_SECONDS", 0.01)
-        self.second_grace_patch = patch.object(keystroke, "STARTUP_SECOND_GRACE_SECONDS", 0.01)
+        self.first_grace_patch = patch.object(keystroke, "STARTUP_FIRST_GRACE_SECONDS", 0.04)
+        self.second_grace_patch = patch.object(keystroke, "STARTUP_SECOND_GRACE_SECONDS", 0.02)
         self.first_grace_patch.start()
         self.second_grace_patch.start()
         self.addCleanup(self.first_grace_patch.stop)
@@ -102,6 +103,19 @@ class StartupKeyboardCheckTests(unittest.TestCase):
         ):
             self.assertFalse(keystroke._startup_keyboard_check())
         self.assertIn("WARNING: STARTUP KEYBOARD TEST FAILED", output.getvalue())
+
+    def test_failed_probes_each_reach_their_timeout_and_then_cancel(self):
+        fake_pyautogui = FakePyAutoGUI(self._listener, dropped_calls={1, 2})
+        started = time.monotonic()
+        with patch.object(keystroke, "pyautogui", fake_pyautogui):
+            self.assertFalse(keystroke._startup_keyboard_check())
+        elapsed = time.monotonic() - started
+
+        # Both independent waits must expire (40 ms + 20 ms in this test),
+        # and the function must return promptly instead of leaving a listener
+        # or an unbounded queue wait running.
+        self.assertGreaterEqual(elapsed, 0.055)
+        self.assertLess(elapsed, 0.5)
 
     def test_startup_preflight_is_enabled_by_default(self):
         args = keystroke._build_parser().parse_args([])

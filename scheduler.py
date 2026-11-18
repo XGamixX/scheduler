@@ -19,9 +19,11 @@ Python 3.9+. Standard-library only.
 from __future__ import annotations
 
 import json
+import queue
 import socket
 import statistics
 import struct
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -49,7 +51,10 @@ NTP_TIMEOUT_SECONDS = 1.5
 SYNC_INTERVAL_SECONDS = 30.0
 RETRY_INTERVAL_SECONDS = 5.0
 SPIN_WINDOW_SECONDS = 0.100
-SYNC_GUARD_SECONDS = 4.0
+FULL_CALIBRATION_MIN_REMAINING_SECONDS = 60.0
+MIN_NTP_SYNC_REMAINING_SECONDS = 10.0
+NTP_REQUEST_CUTOFF_MARGIN_SECONDS = 0.050
+SYSTEM_OFFSET_WARNING_MS = 1_000.0
 MAX_DRIFT_PPM = 50.0  # Conservative growth allowance, not a hardware guarantee.
 CLOCK_STEP_REJECTION_NS = 5_000_000
 NTP_EPOCH = 2_208_988_800
@@ -133,6 +138,47 @@ def resolve_endpoint(host: str) -> Endpoint:
         if family in (socket.AF_INET, socket.AF_INET6):
             return Endpoint(host, family, socktype, proto, sockaddr)
     raise OSError(f"No usable UDP address found for {host}")
+
+
+def resolve_endpoint_before(host: str, deadline_mono_ns: int) -> Optional[Endpoint]:
+    """Resolve a host without letting a blocking system DNS call cross a deadline.
+
+    getaddrinfo() has no portable timeout parameter. Run it in a daemon thread
+    and stop waiting at the supplied monotonic deadline. A slow resolver thread
+    may finish later, but cannot hold up the scheduled keystroke.
+    """
+    if deadline_mono_ns <= time.monotonic_ns():
+        return None
+
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result_queue.put((True, resolve_endpoint(host)))
+        except Exception as exc:
+            result_queue.put((False, exc))
+
+    threading.Thread(
+        target=worker,
+        name=f"dns-resolve-{host}",
+        daemon=True,
+    ).start()
+
+    while True:
+        remaining_ns = deadline_mono_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return None
+        try:
+            succeeded, value = result_queue.get(
+                timeout=min(0.050, remaining_ns / 1e9)
+            )
+        except queue.Empty:
+            continue
+        if succeeded:
+            assert isinstance(value, Endpoint)
+            return value
+        assert isinstance(value, Exception)
+        raise value
 
 
 def query_ntp(endpoint: Endpoint, timeout: float) -> Sample:
@@ -315,13 +361,28 @@ def collect_calibration_round_robin(
     count: int,
     spacing: float,
     timeout: float,
+    stop_before_mono_ns: Optional[int] = None,
 ) -> dict[str, list[Sample]]:
-    """Interleave server probes to reduce time-trend confounding."""
+    """Interleave probes, optionally stopping before a monotonic cutoff.
+
+    Every UDP request is given a timeout that fits before the cutoff with a
+    small margin. No new request is started once the cutoff is reached.
+    """
     result = {endpoint.host: [] for endpoint in endpoints}
     for sample_index in range(count):
         for endpoint in endpoints:
+            request_timeout = timeout
+            if stop_before_mono_ns is not None:
+                remaining_ns = stop_before_mono_ns - time.monotonic_ns()
+                if remaining_ns <= int(NTP_REQUEST_CUTOFF_MARGIN_SECONDS * 1e9):
+                    print("[Calibration] Stopping: the one-minute safety window has begun.")
+                    return result
+                request_timeout = min(
+                    timeout,
+                    remaining_ns / 1e9 - NTP_REQUEST_CUTOFF_MARGIN_SECONDS,
+                )
             try:
-                sample = query_ntp(endpoint, timeout)
+                sample = query_ntp(endpoint, request_timeout)
                 result[endpoint.host].append(sample)
                 print(
                     f"  [{endpoint.host}] {sample_index + 1}/{count}: "
@@ -332,7 +393,18 @@ def collect_calibration_round_robin(
                 print(
                     f"  [{endpoint.host}] {sample_index + 1}/{count} failed: {exc}"
                 )
-            time.sleep(spacing)
+            if spacing > 0:
+                if stop_before_mono_ns is None:
+                    time.sleep(spacing)
+                else:
+                    remaining_ns = stop_before_mono_ns - time.monotonic_ns()
+                    sleep_ns = remaining_ns - int(
+                        NTP_REQUEST_CUTOFF_MARGIN_SECONDS * 1e9
+                    )
+                    if sleep_ns <= 0:
+                        print("[Calibration] Stopping before the one-minute safety window.")
+                        return result
+                    time.sleep(min(spacing, sleep_ns / 1e9))
     return result
 
 
@@ -397,6 +469,7 @@ def calibrate(
     spacing: float,
     timeout: float,
     report_path: Optional[Path],
+    stop_before_mono_ns: Optional[int] = None,
 ) -> ServerCalibration:
     print("[Calibration] Resolving candidate NTP servers...")
     endpoints: list[Endpoint] = []
@@ -404,7 +477,20 @@ def calibrate(
 
     for host in server_names:
         try:
-            endpoint = resolve_endpoint(host)
+            if stop_before_mono_ns is None:
+                endpoint = resolve_endpoint(host)
+            else:
+                endpoint = resolve_endpoint_before(
+                    host,
+                    stop_before_mono_ns
+                    - int(NTP_REQUEST_CUTOFF_MARGIN_SECONDS * 1e9),
+                )
+                if endpoint is None:
+                    print(
+                        "[Calibration] Stopping server resolution before "
+                        "the one-minute safety window."
+                    )
+                    break
         except Exception as exc:
             print(f"  [Calibration] {host}: resolution failed: {exc}")
             continue
@@ -424,7 +510,8 @@ def calibrate(
         f"from {len(endpoints)} distinct resolved endpoints."
     )
     sample_map = collect_calibration_round_robin(
-        endpoints, samples_per_server, spacing, timeout
+        endpoints, samples_per_server, spacing, timeout,
+        stop_before_mono_ns=stop_before_mono_ns,
     )
 
     calibrations: list[ServerCalibration] = []
@@ -521,6 +608,23 @@ class SyncedClock:
         self.base_uncertainty_ns: Optional[int] = None
         self.last_success_mono_ns: Optional[int] = None
         self.last_attempt_mono_ns: Optional[int] = None
+        self.source = "uninitialized"
+
+    def install_system_clock(self) -> None:
+        """Install local system time as the initial, immediately available source."""
+        mono_before = time.monotonic_ns()
+        wall_ns = time.time_ns()
+        mono_after = time.monotonic_ns()
+
+        self.anchor_mono_ns = (mono_before + mono_after) // 2
+        self.anchor_utc_ns = wall_ns
+        # System-clock accuracy is not independently known here, so don't
+        # present a fabricated numeric uncertainty.
+        self.base_uncertainty_ns = None
+        self.last_success_mono_ns = None  # No successful NTP sample yet.
+        self.last_attempt_mono_ns = None
+        self.source = "system clock"
+        print("[Clock] Initial time source: local system clock.")
 
     def install_samples(
         self,
@@ -528,8 +632,8 @@ class SyncedClock:
         offset_correction_ns: int = 0,
         correction_uncertainty_ns: int = 0,
     ) -> None:
-        if len(samples) < 2:
-            raise RuntimeError("At least two successful NTP samples are required")
+        if not samples:
+            raise RuntimeError("At least one successful NTP sample is required")
 
         corrected_constants = [
             sample.utc_minus_mono_ns - offset_correction_ns
@@ -549,39 +653,70 @@ class SyncedClock:
             + int(statistics.median(s.root_distance_ns for s in selected))
             + jitter_ns
         )
+        if len(selected) == 1:
+            # A single late-window sample is usable, but less statistically
+            # robust than a multi-sample estimate.
+            sample_uncertainty_ns += 5_000_000
 
         self.anchor_mono_ns = time.monotonic_ns()
         self.anchor_utc_ns = self.anchor_mono_ns + utc_minus_mono
         self.base_uncertainty_ns = sample_uncertainty_ns + correction_uncertainty_ns
         self.last_success_mono_ns = self.anchor_mono_ns
         self.last_attempt_mono_ns = self.anchor_mono_ns
+        self.source = "NTP"
 
         print(
             "[Clock] Model updated: estimated uncertainty proxy "
             f"{self.base_uncertainty_ns / 1e6:.3f} ms "
             "(not a guaranteed maximum-error bound)."
         )
+        if len(samples) == 1:
+            print("[Clock] WARNING: clock model uses only one NTP sample.")
+        self.report_system_offset("NTP synchronization")
 
     def now_utc_ns(self) -> int:
         if self.anchor_mono_ns is None or self.anchor_utc_ns is None:
             raise RuntimeError("Clock has not been synchronized")
         return self.anchor_utc_ns + (time.monotonic_ns() - self.anchor_mono_ns)
 
-    def uncertainty_ns(self) -> int:
-        if self.base_uncertainty_ns is None or self.anchor_mono_ns is None:
+    def uncertainty_ns(self) -> Optional[int]:
+        if self.anchor_mono_ns is None:
             raise RuntimeError("Clock has not been synchronized")
+        if self.base_uncertainty_ns is None:
+            return None
         elapsed_ns = max(0, time.monotonic_ns() - self.anchor_mono_ns)
         drift_ns = int(elapsed_ns * self.max_drift_ppm / 1_000_000)
         return self.base_uncertainty_ns + drift_ns
 
+    def report_system_offset(self, context: str) -> int:
+        """Print this clock model's offset relative to the OS wall clock."""
+        model_utc_ns = self.now_utc_ns()
+        system_utc_ns = time.time_ns()
+        offset_ns = model_utc_ns - system_utc_ns
+        offset_ms = offset_ns / 1_000_000
+        print(
+            f"[Clock] Offset to system time after {context}: "
+            f"{offset_ms:+.3f} ms (NTP/model minus system clock)."
+        )
+        if abs(offset_ms) >= SYSTEM_OFFSET_WARNING_MS:
+            print(
+                "[Clock] WARNING: NTP/model time differs from system time by "
+                f"at least {SYSTEM_OFFSET_WARNING_MS:.0f} ms. Continuing anyway."
+            )
+        return offset_ns
+
     def needs_sync(self, interval_seconds: float, retry_seconds: float) -> bool:
+        now = time.monotonic_ns()
         if self.last_attempt_mono_ns is None:
             return True
-        reference = self.last_success_mono_ns
-        if reference is None:
-            return True
-        since_attempt = time.monotonic_ns() - self.last_attempt_mono_ns
-        since_success = time.monotonic_ns() - reference
+
+        since_attempt = now - self.last_attempt_mono_ns
+        if self.last_success_mono_ns is None:
+            # While still on the system-clock fallback, retry at the retry
+            # interval instead of spinning on every scheduler loop.
+            return since_attempt >= int(retry_seconds * 1e9)
+
+        since_success = now - self.last_success_mono_ns
         return (
             since_success >= int(interval_seconds * 1e9)
             and since_attempt >= int(retry_seconds * 1e9)
@@ -620,17 +755,73 @@ def next_local_target_utc_ns(target_text: str) -> int:
     return target_ns
 
 
+def collect_single_server_samples(
+    endpoint: Endpoint,
+    clock: SyncedClock,
+    target_utc_ns: int,
+    count: int,
+    spacing: float,
+    timeout: float,
+) -> list[Sample]:
+    """Collect samples without starting any request inside the final 10 s.
+
+    Each UDP timeout is shortened to fit before the 10-second cutoff. The
+    50 ms margin reduces the chance that a request remains outstanding at the
+    cutoff because of normal timeout/scheduler overhead.
+    """
+    samples: list[Sample] = []
+    cutoff_ns = int(MIN_NTP_SYNC_REMAINING_SECONDS * 1e9)
+    margin_ns = int(NTP_REQUEST_CUTOFF_MARGIN_SECONDS * 1e9)
+
+    for index in range(count):
+        remaining_ns = target_utc_ns - clock.now_utc_ns()
+        available_ns = remaining_ns - cutoff_ns - margin_ns
+        if available_ns <= 0:
+            print(
+                "[NTP] Stopping synchronization: no new requests are allowed "
+                "within 10 seconds of the target."
+            )
+            break
+
+        request_timeout = min(timeout, available_ns / 1e9)
+        if request_timeout <= 0:
+            break
+
+        try:
+            sample = query_ntp(endpoint, request_timeout)
+            samples.append(sample)
+            print(
+                f"  [NTP] {index + 1}/{count}: "
+                f"offset={sample.offset_ns / 1e6:+.3f} ms, "
+                f"RTT={sample.delay_ns / 1e6:.3f} ms"
+            )
+        except Exception as exc:
+            print(f"  [NTP] {index + 1}/{count} failed: {exc}")
+
+        if index + 1 < count and spacing > 0:
+            remaining_ns = target_utc_ns - clock.now_utc_ns()
+            sleep_ns = remaining_ns - cutoff_ns - margin_ns
+            if sleep_ns <= 0:
+                break
+            time.sleep(min(spacing, sleep_ns / 1e9))
+
+    return samples
+
+
 def wait_until(
     clock: SyncedClock,
     target_utc_ns: int,
-    endpoint: Endpoint,
+    endpoint: Optional[Endpoint],
+    server_name: str,
     offset_correction_ns: int,
     correction_uncertainty_ns: int,
     sync_interval: float,
     retry_interval: float,
     timeout: float,
 ) -> None:
-    print("[Scheduler] Waiting using an NTP-derived UTC model mapped to monotonic time.")
+    print(
+        f"[Scheduler] Waiting using {clock.source} time mapped to monotonic time."
+    )
 
     while True:
         remaining_ns = target_utc_ns - clock.now_utc_ns()
@@ -638,29 +829,47 @@ def wait_until(
             return
         remaining_seconds = remaining_ns / 1e9
 
-        sync_budget = SYNC_SAMPLES * timeout + (SYNC_SAMPLES - 1) * SYNC_SPACING_SECONDS + 0.5
-        sync_guard = max(SYNC_GUARD_SECONDS, sync_budget)
-
-        # Never start a blocking network request near the target.
-        if remaining_seconds > sync_guard and clock.needs_sync(sync_interval, retry_interval):
+        # Every initial sync and refresh obeys the same hard 10-second rule.
+        if (
+            remaining_seconds > MIN_NTP_SYNC_REMAINING_SECONDS
+            and clock.needs_sync(sync_interval, retry_interval)
+        ):
             clock.last_attempt_mono_ns = time.monotonic_ns()
-            print(f"[NTP] Refreshing selected server: {endpoint.host}")
-            samples: list[Sample] = []
-            for index in range(SYNC_SAMPLES):
+            if endpoint is None:
                 try:
-                    sample = query_ntp(endpoint, timeout)
-                    samples.append(sample)
-                    print(
-                        f"  [NTP] refresh {index + 1}/{SYNC_SAMPLES}: "
-                        f"offset={sample.offset_ns / 1e6:+.3f} ms, "
-                        f"RTT={sample.delay_ns / 1e6:.3f} ms"
+                    remaining_ns = target_utc_ns - clock.now_utc_ns()
+                    resolution_deadline = (
+                        time.monotonic_ns()
+                        + remaining_ns
+                        - int(MIN_NTP_SYNC_REMAINING_SECONDS * 1e9)
+                        - int(NTP_REQUEST_CUTOFF_MARGIN_SECONDS * 1e9)
                     )
+                    endpoint = resolve_endpoint_before(
+                        server_name, resolution_deadline
+                    )
+                    if endpoint is None:
+                        print(
+                            "[NTP] DNS resolution did not finish before the "
+                            "10-second cutoff; retaining the current clock model."
+                        )
+                        clock.mark_failed_attempt()
+                        continue
                 except Exception as exc:
-                    print(f"  [NTP] refresh {index + 1}/{SYNC_SAMPLES} failed: {exc}")
-                if index + 1 < SYNC_SAMPLES:
-                    time.sleep(SYNC_SPACING_SECONDS)
+                    print(f"[NTP] Could not resolve {server_name}: {exc}")
+                    clock.mark_failed_attempt()
+                    continue
 
-            if len(samples) >= 2:
+            print(f"[NTP] Refreshing selected server: {endpoint.host}")
+            samples = collect_single_server_samples(
+                endpoint=endpoint,
+                clock=clock,
+                target_utc_ns=target_utc_ns,
+                count=SYNC_SAMPLES,
+                spacing=SYNC_SPACING_SECONDS,
+                timeout=timeout,
+            )
+
+            if samples:
                 clock.install_samples(
                     samples,
                     offset_correction_ns=offset_correction_ns,
@@ -678,17 +887,21 @@ def wait_until(
         if remaining_ns > int(SPIN_WINDOW_SECONDS * 1e9):
             sleep_ns = remaining_ns - int(SPIN_WINDOW_SECONDS * 1e9)
 
-            # Wake at the next refresh deadline if it occurs before the spin window.
-            if (
-                clock.last_success_mono_ns is not None
-                and clock.last_attempt_mono_ns is not None
-            ):
-                next_sync_ns = max(
-                    clock.last_success_mono_ns + int(sync_interval * 1e9),
-                    clock.last_attempt_mono_ns + int(retry_interval * 1e9),
+            # Wake for the next retry/refresh, including while still on the
+            # system-clock fallback with no successful NTP sample yet.
+            if clock.last_attempt_mono_ns is not None:
+                retry_due_ns = (
+                    clock.last_attempt_mono_ns + int(retry_interval * 1e9)
                 )
+                if clock.last_success_mono_ns is None:
+                    next_sync_ns = retry_due_ns
+                else:
+                    regular_due_ns = (
+                        clock.last_success_mono_ns + int(sync_interval * 1e9)
+                    )
+                    next_sync_ns = max(regular_due_ns, retry_due_ns)
                 until_sync_ns = next_sync_ns - time.monotonic_ns()
-                if until_sync_ns > 0 and remaining_seconds > sync_guard:
+                if until_sync_ns > 0:
                     sleep_ns = min(sleep_ns, until_sync_ns)
 
             time.sleep(max(0.0005, sleep_ns / 1e9))
