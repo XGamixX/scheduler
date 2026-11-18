@@ -1,4 +1,18 @@
-[![AI:X EXECUTE](https://img.shields.io/badge/AI-EXECUTE-grey?style=flat&logoSize=auto&labelColor=13171f)](https://0rwx.com)
+> [!NOTE]
+>
+> <table>
+>   <tr>
+>     <td align="center">
+>       <picture>
+>         <source srcset="https://cdn.by-cra.net/static/0rwx.com/AI-X-dark.svg"
+>                 media="(prefers-color-scheme: dark)">
+>         <img src="https://cdn.by-cra.net/static/0rwx.com/AI-X-light.svg"
+>              alt="AI:X (0rwx.com)" height="32">
+>       </picture>
+>     </td>
+>     <td>AI:X Written by ChatGPT, idea for calibration process by me</td>
+>   </tr>
+> </table>
 
 NTP-SYNCHRONIZED KEYSTROKE SCHEDULER
 ===================================
@@ -35,9 +49,9 @@ Adjust calibration samples (default 12 per server):
 Disable the JSON calibration report:
     python keystroke.py --time 14:30:00 --key enter --calibrate --calibration-report ""
 
-Run synthetic equation tests
+Run synthetic equation test
 ----------------------------
-python -m unittest -v test_directional_math.py test_cli_imports.py
+python -m unittest -v test_directional_math.py
 
 Using scheduler.py as a library
 -------------------------------
