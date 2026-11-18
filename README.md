@@ -3,14 +3,18 @@
 > <table>
 >   <tr>
 >     <td align="center">
->       <picture>
->         <source srcset="https://cdn.by-cra.net/static/0rwx.com/AI-X-dark.svg"
->                 media="(prefers-color-scheme: dark)">
->         <img src="https://cdn.by-cra.net/static/0rwx.com/AI-X-light.svg"
->              alt="AI:X (0rwx.com)" height="32">
->       </picture>
+>       <a href="https://0rwx.com" target="_blank" rel="noopener noreferrer"
+>         title="AI:X (0rwx.com)">
+>         <picture>
+>           <source srcset="https://cdn.by-cra.net/static/0rwx.com/AI-X-dark.svg"
+>                   media="(prefers-color-scheme: dark)">
+>           <img src="https://cdn.by-cra.net/static/0rwx.com/AI-X-light.svg"
+>                alt="AI:X (0rwx.com)"
+>                height="32">
+>         </picture>
+>       </a>
 >     </td>
->     <td>AI:X Written by ChatGPT, idea for calibration process by me</td>
+>     <td>AI:X Code written by ChatGPT, idea for calibration process by me</td>
 >   </tr>
 > </table>
 
