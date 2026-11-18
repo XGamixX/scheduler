@@ -104,6 +104,36 @@ class StartupKeyboardCheckTests(unittest.TestCase):
             self.assertFalse(keystroke._startup_keyboard_check())
         self.assertIn("WARNING: STARTUP KEYBOARD TEST FAILED", output.getvalue())
 
+    def test_slow_listener_shutdown_is_not_reported_as_keyboard_failure(self):
+        fake_pyautogui = FakePyAutoGUI(self._listener)
+        listener = None
+
+        # Simulate a backend whose daemon listener takes longer to exit after
+        # stop(). Both key probes are still captured successfully.
+        class SlowStopListener(FakeListener):
+            def stop(self):
+                pass
+
+        def make_slow_listener(on_press):
+            nonlocal listener
+            listener = SlowStopListener(on_press)
+            self.listeners.append(listener)
+            return listener
+
+        keyboard_module = types.SimpleNamespace(Listener=make_slow_listener)
+        pynput_module = types.SimpleNamespace(keyboard=keyboard_module)
+        with patch.dict(sys.modules, {"pynput": pynput_module}), patch.object(
+            keystroke, "pyautogui", fake_pyautogui
+        ):
+            output = io.StringIO()
+            with patch("builtins.print", side_effect=lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")):
+                self.assertTrue(keystroke._startup_keyboard_check())
+
+        self.assertIsNotNone(listener)
+        self.assertTrue(listener.is_alive())
+        self.assertIn("Non-fatal", output.getvalue())
+        self.assertNotIn("WARNING: STARTUP KEYBOARD TEST FAILED", output.getvalue())
+
     def test_failed_probes_each_reach_their_timeout_and_then_cancel(self):
         fake_pyautogui = FakePyAutoGUI(self._listener, dropped_calls={1, 2})
         started = time.monotonic()

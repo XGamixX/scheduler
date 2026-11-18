@@ -57,6 +57,7 @@ STARTUP_FIRST_KEY = "enter"
 STARTUP_SECOND_KEY = "enter"
 STARTUP_FIRST_GRACE_SECONDS = 10.0
 STARTUP_SECOND_GRACE_SECONDS = 1.0
+STARTUP_LISTENER_JOIN_TIMEOUT_SECONDS = 1.0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -229,21 +230,31 @@ def _startup_keyboard_check() -> bool:
     if listener is not None:
         try:
             listener.stop()
-            listener.join(timeout=0.10)
+            listener.join(timeout=STARTUP_LISTENER_JOIN_TIMEOUT_SECONDS)
             if listener.is_alive():
                 listener_shutdown_error = (
-                    "The global keyboard listener did not stop within 100 ms."
+                    "The global keyboard listener is still shutting down after "
+                    f"{STARTUP_LISTENER_JOIN_TIMEOUT_SECONDS:g} second(s)."
                 )
         except Exception:
             listener_shutdown_error = "Could not cleanly stop the global keyboard listener."
 
-    if second_caught and listener_shutdown_error is None:
+    if second_caught:
         if first_caught:
             print("[Startup] Keyboard injection and global capture verified.", flush=True)
         else:
             print(
                 "[Startup] Second probe captured; the first probe was likely lost "
                 "during permission/hook initialization.",
+                flush=True,
+            )
+        if listener_shutdown_error:
+            # Probe capture succeeded, so this is cleanup latency rather than
+            # a keyboard-functionality failure. The listener is a daemon thread
+            # and will not prevent process exit.
+            print(
+                "[Startup] Non-fatal: " + listener_shutdown_error + " "
+                "Continuing; keyboard capture was already verified.",
                 flush=True,
             )
         return True

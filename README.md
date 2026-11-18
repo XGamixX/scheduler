@@ -26,7 +26,8 @@ test_listener.py            System-clock-only global key listener for sanity che
 tests/test_directional_math.py      Synthetic tests for directional-delay equations.
 tests/test_startup_keyboard_check.py  Tests for the Enter-based startup keyboard check.
 requirements.txt            Dependencies for the command-line and test tools.
-README.md                   Documentation.
+README.md                   Usage documentation.
+SPEC.md                     Technical specification for algorithms and procedures.
 
 Install
 -------
@@ -159,3 +160,11 @@ Scheduling and limitations
 - macOS may require Accessibility/Input Monitoring permissions. Linux Wayland
   may restrict global keyboard monitoring and synthetic input; X11 is usually
   more compatible. The keystroke entry point requires an interactive desktop.
+
+
+## Startup keyboard preflight
+
+The two Enter probes have independent 10-second and 1-second capture deadlines.
+After successful capture, listener shutdown is given up to one second. A slow
+shutdown is reported as a non-fatal cleanup notice, not as a keyboard test
+failure; the listener runs as a daemon and cannot prevent process exit.
