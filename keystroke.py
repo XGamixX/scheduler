@@ -47,8 +47,8 @@ from scheduler import (
 if pyautogui is not None:
     pyautogui.PAUSE = 0
 
-DEFAULT_TARGET = "14:30:00"
-DEFAULT_KEY = "enter"
+DEFAULT_TARGET = "20:00:00"
+DEFAULT_KEY = "f5"
 
 # Enter is broadly supported by desktop input backends. The initial prompt
 # confirms that the terminal is focused; these two injected Enter presses
@@ -63,6 +63,7 @@ STARTUP_LISTENER_JOIN_TIMEOUT_SECONDS = 1.0
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--time", default=DEFAULT_TARGET, help="Local target time HH:MM:SS")
+    parser.add_argument("--offset", default=0, help="Offset added to target time in milliseconds")
     parser.add_argument("--key", default=DEFAULT_KEY, help="PyAutoGUI key name, e.g. enter, space, f5")
     parser.add_argument("--server", default=DEFAULT_SERVER, help="NTP server when calibration is disabled")
     parser.add_argument("--calibrate", action="store_true", help="Run multi-server directional-variation calibration")
@@ -302,7 +303,7 @@ def main() -> int:
     # Select the requested local wall-clock occurrence, then immediately
     # establish the system clock as the initial time source. NTP may replace
     # this model, but the scheduler never starts without a usable clock.
-    target_utc_ns = next_local_target_utc_ns(args.time)
+    target_utc_ns = next_local_target_utc_ns(args.time) + args.offset
     clock = SyncedClock(MAX_DRIFT_PPM)
     clock.install_system_clock()
 
