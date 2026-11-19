@@ -63,10 +63,16 @@ STARTUP_LISTENER_JOIN_TIMEOUT_SECONDS = 1.0
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--time", default=DEFAULT_TARGET, help="Local target time HH:MM:SS")
-    parser.add_argument("--offset", default=0, help="Offset added to target time in milliseconds")
+    parser.add_argument("--offset", type=int, default=0, help="Offset added to target time in milliseconds")
     parser.add_argument("--key", default=DEFAULT_KEY, help="PyAutoGUI key name, e.g. enter, space, f5")
     parser.add_argument("--server", default=DEFAULT_SERVER, help="NTP server when calibration is disabled")
-    parser.add_argument("--calibrate", action="store_true", help="Run multi-server directional-variation calibration")
+    parser.add_argument(
+        "--no-calibrate",
+        "--skip--calibrate",
+        dest="calibrate",
+        action="store_false",
+        default=True,
+        help="Run multi-server directional-variation calibration")
     parser.add_argument("--samples", type=int, default=DEFAULT_CALIBRATION_SAMPLES, help="Calibration samples per server")
     parser.add_argument("--sync-interval", type=float, default=SYNC_INTERVAL_SECONDS, help="Seconds between successful refreshes")
     parser.add_argument("--retry-interval", type=float, default=RETRY_INTERVAL_SECONDS, help="Minimum delay between failed refresh attempts")
@@ -303,7 +309,7 @@ def main() -> int:
     # Select the requested local wall-clock occurrence, then immediately
     # establish the system clock as the initial time source. NTP may replace
     # this model, but the scheduler never starts without a usable clock.
-    target_utc_ns = next_local_target_utc_ns(args.time) + args.offset
+    target_utc_ns = next_local_target_utc_ns(args.time) + args.offset * 1e6
     clock = SyncedClock(MAX_DRIFT_PPM)
     clock.install_system_clock()
 
