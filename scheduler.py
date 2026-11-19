@@ -40,7 +40,9 @@ CALIBRATION_SERVERS = (
     "time.google.com",
     "time.windows.com",
     "time.apple.com",
-    "pool.ntp.org",
+    "time-a-wwv.nist.gov",
+    "time-a-g.nist.gov",
+    "ntp-01.jeffgeerling.com",
 )
 
 DEFAULT_CALIBRATION_SAMPLES = 12
