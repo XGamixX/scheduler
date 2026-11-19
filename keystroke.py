@@ -302,6 +302,9 @@ def main() -> int:
     if args.sync_interval <= 0 or args.retry_interval <= 0 or args.timeout <= 0:
         parser.error("--sync-interval, --retry-interval and --timeout must be positive")
 
+    if len(args.time)!=8 or args.time[2::3]!="::":
+        raise SystemExit("Invalid time argument, should be HH:MM:SS")
+
     # Complete any permissions/focus prompt before selecting today's target.
     if args.startup_key_test:
         _startup_keyboard_check()
