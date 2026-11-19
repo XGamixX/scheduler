@@ -411,7 +411,7 @@ Procedure:
 4. Arm the global keyboard listener and wait for the specified key (default Enter; `*` may be used to accept any key).
 5. On the first matching callback, record `time.time_ns()`, stop listening, and print the key name, local timestamp, UTC timestamp, Unix nanoseconds, and signed lateness relative to the target.
 
-The printed timestamp is when the Python callback ran. It is not a hardware or device-driver timestamp of when the physical/synthetic event first entered the operating system. The listener uses only the system wall clock for target arming and is intended to compare observed delivery with the scheduler's intended target.
+The printed timestamp is when the Python callback ran. It is not a hardware or device-driver timestamp of when the physical/synthetic event first entered the operating system. The listener uses only the system wall clock for target arming and is intended to compare observed delivery with the scheduler's intended target. The signed `Relative to target` value is `target - captured system time`: positive means the target is ahead of the captured system timestamp (the event was early), and negative means the event was late. This matches the scheduler's sign convention for model/NTP time minus system time.
 
 ## 10. Command-line interface
 

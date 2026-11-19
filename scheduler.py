@@ -823,11 +823,27 @@ def wait_until(
         f"[Scheduler] Waiting using {clock.source} time mapped to monotonic time."
     )
 
+    countdown_milestones = (60, 30, 10, 5)
+    pending_milestones = set(countdown_milestones)
+
     while True:
         remaining_ns = target_utc_ns - clock.now_utc_ns()
         if remaining_ns <= 0:
             return
         remaining_seconds = remaining_ns / 1e9
+
+        for milestone in countdown_milestones:
+            if milestone in pending_milestones and remaining_seconds <= milestone:
+                if milestone == 5:
+                    print(
+                        "[Scheduler] T-5: 5 seconds remaining; final live-check "
+                        "phase approaching. The last 100 ms will be silent to "
+                        "avoid console-output latency.",
+                        flush=True,
+                    )
+                else:
+                    print(f"[Scheduler] T-{milestone}: {milestone} seconds remaining.", flush=True)
+                pending_milestones.remove(milestone)
 
         # Every initial sync and refresh obeys the same hard 10-second rule.
         if (
@@ -886,6 +902,17 @@ def wait_until(
 
         if remaining_ns > int(SPIN_WINDOW_SECONDS * 1e9):
             sleep_ns = remaining_ns - int(SPIN_WINDOW_SECONDS * 1e9)
+
+            # Also wake at the next countdown milestone rather than sleeping
+            # through it. Milestones already printed are removed above.
+            next_milestone = max(
+                (milestone for milestone in pending_milestones if remaining_seconds > milestone),
+                default=None,
+            )
+            if next_milestone is not None:
+                until_milestone_ns = remaining_ns - int(next_milestone * 1e9)
+                if until_milestone_ns > 0:
+                    sleep_ns = min(sleep_ns, until_milestone_ns)
 
             # Wake for the next retry/refresh, including while still on the
             # system-clock fallback with no successful NTP sample yet.

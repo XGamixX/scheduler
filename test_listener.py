@@ -122,13 +122,16 @@ def main() -> int:
 
     local_time = datetime.fromtimestamp(received_ns / 1e9).astimezone()
     utc_time = datetime.fromtimestamp(received_ns / 1e9, tz=timezone.utc)
-    lateness_ms = (received_ns - target_ns) / 1e6
+    # Match scheduler.py's sign convention: positive means the reference
+    # (target) time is ahead of the system-clock timestamp; negative means
+    # the captured event occurred after the target.
+    relative_to_target_ms = (target_ns - received_ns) / 1e6
 
     print(f"[Test] Captured key: {name}")
     print(f"[Test] Local system time: {local_time.isoformat(timespec='microseconds')}")
     print(f"[Test] UTC system time:   {utc_time.isoformat(timespec='microseconds')}")
     print(f"[Test] Unix time ns:      {received_ns}")
-    print(f"[Test] Relative to target: {lateness_ms:+.3f} ms")
+    print(f"[Test] Relative to target (target - captured system time): {relative_to_target_ms:+.3f} ms")
     print(
         "[Test] Note: this is the time the Python input callback ran, "
         "not a hardware timestamp of the original key event."

@@ -240,6 +240,9 @@ def _startup_keyboard_check() -> bool:
             listener_shutdown_error = "Could not cleanly stop the global keyboard listener."
 
     if second_caught:
+        print(f"[Startup] Second probe ({STARTUP_SECOND_KEY.upper()}) captured.", flush=True)
+
+    if second_caught and listener_shutdown_error is None:
         if first_caught:
             print("[Startup] Keyboard injection and global capture verified.", flush=True)
         else:
